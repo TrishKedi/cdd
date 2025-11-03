@@ -320,6 +320,7 @@ class CodeBlock:
             List of extracted code blocks with their metadata
         """
         try:
+            # Call fragments_from_file with no parser/language (it will create new ones)
             fragments = self.fragments_from_file(file_path)
             typer.echo(f"📄 Loaded {file_path} ({len(fragments)} fragments)")
             return fragments
@@ -580,7 +581,7 @@ class CodeBlock:
                 name = query.capture_names[second]
             yield node, name
 
-    def get_controller_nodes(self, tree: tree_sitter.Tree) -> List[tree_sitter.Node]:
+    def get_controller_nodes(self, tree: tree_sitter.Tree, language: Optional[Language] = None) -> List[tree_sitter.Node]:
         """Extract controller object nodes from a JavaScript AST.
         
         Looks for patterns matching controller objects in Angular-style code,
@@ -588,12 +589,15 @@ class CodeBlock:
         
         Args:
             tree: The parsed tree-sitter AST to search
+            language: Optional tree-sitter language instance. If not provided, uses self.JAVASCRIPT
             
         Returns:
             List of tree-sitter nodes representing controller objects
         """
         controller_objs = []
-        controller_q = Query(self.JAVASCRIPT, self.CONTROLLER_QUERY)
+        # Use provided language or fall back to self.JAVASCRIPT
+        js_lang = language or self.JAVASCRIPT
+        controller_q = Query(js_lang, self.CONTROLLER_QUERY)
         controller_q_result = controller_q.captures(tree.root_node)
         
         if controller_q_result.get('controller_obj'):
@@ -660,7 +664,7 @@ class CodeBlock:
     #     # print(f'FRAGS:\n{frags}\n')
     #     return frags
 
-    def extract_function_nodes(self, root_node: tree_sitter.Node, code_bytes: bytes) -> List[Dict[str, Any]]:
+    def extract_function_nodes(self, root_node: tree_sitter.Node, code_bytes: bytes, language: Optional[Language] = None) -> List[Dict[str, Any]]:
         """Extract function-like nodes from a JavaScript AST.
         
         This method identifies and extracts various types of function definitions
@@ -670,12 +674,15 @@ class CodeBlock:
         Args:
             root_node: The root node of the AST to search
             code_bytes: The raw bytes of the source code
+            language: Optional tree-sitter language instance. If not provided, uses self.JAVASCRIPT
             
         Returns:
             List of dictionaries containing extracted function information with
             keys: 'code', 'start', 'end', and optional metadata
         """
-        query = Query(self.JAVASCRIPT, self.ARROW_FUNCS)
+        # Use provided language or fall back to self.JAVASCRIPT
+        js_lang = language or self.JAVASCRIPT
+        query = Query(js_lang, self.ARROW_FUNCS)
         
         # Valid function-like node types
         FUNCTION_TYPES = {
@@ -821,7 +828,7 @@ class CodeBlock:
 
         return snippet
 
-    def fragments_from_file(self, file_path: Path) -> List[Dict[str, Any]]:
+    def fragments_from_file(self, file_path: Path, parser: Optional[Parser] = None, language: Optional[Language] = None) -> List[Dict[str, Any]]:
         """Extract and process code fragments from a JavaScript file.
         
         This method:
@@ -832,6 +839,8 @@ class CodeBlock:
         
         Args:
             file_path: Path to the JavaScript file to process
+            parser: Optional tree-sitter parser instance. If not provided, creates a new one
+            language: Optional tree-sitter language instance. If not provided, creates a new one
             
         Returns:
             List of dictionaries containing code blocks with metadata:
@@ -845,24 +854,26 @@ class CodeBlock:
             UnicodeDecodeError: If file cannot be read as UTF-8
             tree_sitter.LanguageError: If parsing fails
         """
+        # Initialize or use provided parser/language
+        if language is None:
+            language = Language(tsjs.language())
+        if parser is None:
+            parser = Parser(language)
+            
         # Read and parse the file
         code = file_path.read_text(encoding="utf-8")
-        tree = self.parse_js(code)
+        tree = parser.parse(bytes(code, "utf-8"))
         root_node = tree.root_node
         
         # Check for Angular controller pattern
-        ctr_node = self.get_controller_nodes(tree)
+        ctr_node = self.get_controller_nodes(tree, language)
         if ctr_node:
-            print("Controller Node Detected")
+            typer.echo("Controller Node Detected")
             root_node = ctr_node[0]
-        else:
-            print("No Controller Node Detected")
         
-        # Extract function nodes
-        fragments = self.extract_function_nodes(
-            root_node, 
-            code.encode("utf-8")
-        )
+        # Extract function nodes using existing method
+        code_bytes = code.encode("utf-8")
+        fragments = self.extract_function_nodes(root_node, code_bytes, language)
         
         # Process and normalize fragments
         processed_fragments = [
