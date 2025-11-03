@@ -121,6 +121,11 @@ class CodeBlock:
         self.JAVASCRIPT: Language = Language(tsjs.language())
         self.code_blocks: List[Dict[str, Any]] = []
         self.parser: Parser = Parser(self.JAVASCRIPT)
+        self.exclude_patterns = DEFAULT_EXCLUDE_PATTERNS
+        self.minified_patterns = [re.compile(pattern) for pattern in MINIFIED_JS_INDICATORS]
+        self.cache = FileProcessingCache()  # Initialize the cache handler
+        self.cache_hits = 0
+        self.cache_misses = 0
         self.CONTROLLER_QUERY: str = r"""
         (call_expression
         function: (member_expression
@@ -424,6 +429,58 @@ class CodeBlock:
         """
         for frag_key, frag in enumerate(all_fragments):
             frag['id'] = frag_key
+            
+    def update_cache(self, file_path: Path, fragments: List[Dict[str, Any]]) -> None:
+        """Update the cache with new file fragments.
+        
+        Args:
+            file_path: Path to the processed file
+            fragments: List of extracted code fragments
+        """
+        try:
+            stat = file_path.stat()
+            self.cache.cache[str(file_path)] = FileCache(
+                mtime=stat.st_mtime,
+                size=stat.st_size,
+                fragments=fragments,
+                hash=hashlib.sha256(file_path.read_bytes()).hexdigest()
+            )
+            self.cache.save_cache()  # Persist cache to disk
+        except Exception as e:
+            typer.echo(f"⚠️ Cache update failed for {file_path}: {e}")
+            
+    def check_cache(self, file_path: Path) -> Optional[List[Dict[str, Any]]]:
+        """Check if a file is in the cache and return its fragments if valid.
+        
+        This method:
+        1. Checks if the file exists in the cache
+        2. Validates file metadata (size and mtime) hasn't changed
+        3. Returns cached fragments if valid, None otherwise
+        
+        Args:
+            file_path: Path to the file to check in cache
+            
+        Returns:
+            List of cached fragments if valid cache exists, None otherwise
+        """
+        try:
+            stat = file_path.stat()
+            path_str = str(file_path)
+            
+            # Check if file is in cache and metadata matches
+            if path_str in self.cache.cache:  # Use FileProcessingCache's cache dict
+                cached = self.cache.cache[path_str]
+                if (cached.mtime == stat.st_mtime and 
+                    cached.size == stat.st_size):
+                    self.cache_hits += 1
+                    return cached.fragments
+            
+            self.cache_misses += 1
+            return None
+            
+        except Exception as e:
+            typer.echo(f"⚠️ Cache check failed for {file_path}: {e}")
+            return None
         
     @staticmethod
     def babel_ast_from_code(code: str) -> Dict[str, Any]:
@@ -453,6 +510,53 @@ class CodeBlock:
             A tree-sitter Tree object representing the parsed code
         """
         return self.parser.parse(bytes(code, "utf-8"))
+
+    def should_process_file(self, file_path: Path) -> bool:
+        """Determine if a file should be processed based on filtering rules.
+        
+        This method applies several filters to determine if a file should be processed:
+        1. Checks against exclude patterns (test files, minified files, etc.)
+        2. Analyzes file content for minification
+        3. Validates file size
+        
+        Args:
+            file_path: Path to the JavaScript file
+            
+        Returns:
+            bool: True if the file should be processed, False if it should be skipped
+        """
+        try:
+            # Check against exclude patterns
+            for pattern in self.exclude_patterns:
+                if file_path.match(pattern):
+                    typer.echo(f"📝 Skipping excluded file: {file_path}")
+                    return False
+            
+            # Check file size (skip if too large)
+            if file_path.stat().st_size > 1_000_000:  # Skip files larger than 1MB
+                typer.echo(f"📝 Skipping large file: {file_path}")
+                return False
+            
+            # Read first few KB to check for minification
+            sample = file_path.read_text(encoding='utf-8', errors='ignore')[:5000]
+            
+            # Check for minification indicators
+            for pattern in self.minified_patterns:
+                if pattern.search(sample):
+                    typer.echo(f"📝 Skipping minified file: {file_path}")
+                    return False
+            
+            # Check for suspiciously long lines (typical in minified code)
+            max_line_length = max(len(line) for line in sample.splitlines()[:10], default=0)
+            if max_line_length > 500:
+                typer.echo(f"📝 Skipping likely minified file (long lines): {file_path}")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            typer.echo(f"⚠️ Error checking file {file_path}: {e}")
+            return False
 
     def iter_captures(self, query: Query, root: tree_sitter.Node) -> Iterator[Tuple[tree_sitter.Node, str]]:
         """Normalize Tree-sitter captures to (node, capture_name) pairs.
