@@ -151,26 +151,35 @@ def run_pipeline(
                 faiss_indexes.append(os.path.join(INDEX_DIR, faiss_file))
                 continue
 
-            code_blocks = retrieve_code_blocks(code_directory)
-            index_registry_id, index_path = await build_code_index(code_blocks, code_directory)
-            embeddings = generate_embeddings(code_blocks)
-            store_embeddings(embeddings, index_path)
+            # Process code blocks in batches, building index and storing embeddings as we go
+            index_registry_id, index_path = await process_code_blocks_in_batches(code_directory)
             index_path_id_map[index_registry_id] = index_path
 
-    
-        # matches = await run_exhaustive_similarity_lookup(index_path_id_map)
-        # print(f"MATCHES: \n\n\n{matches[0]}\n\n\n")
-
-
-        # display_matches(matches[0], verbose, export)
 
     asyncio.run(run_all())
 
-def retrieve_code_blocks(code_directory):
+async def process_code_blocks_in_batches(code_directory):
+    """
+    Process code blocks in batches, building index and generating embeddings for each batch.
+    This function implements a streaming pipeline where each batch is fully processed
+    (indexed, embedded, and stored) before moving to the next batch.
+    
+    Args:
+        code_directory: Path to the directory containing code files
+        
+    Returns:
+        tuple: (index_registry_id, index_path) for the processed repository
+    """
     BATCH_SIZE = 50  # Adjust based on your memory constraints
     total_blocks = 0
     code_blocks = []
     code_block_service = CodeBlock()
+    model = Model()
+    embedding_index = None
+    
+    # Track index info after first batch
+    index_registry_id = None
+    index_path = None
 
     for block in code_block_service.extract_raw_code(code_directory, batch_size=BATCH_SIZE):
         code_blocks.append(block)
@@ -178,26 +187,39 @@ def retrieve_code_blocks(code_directory):
         
         # Process in batches to manage memory
         if len(code_blocks) >= BATCH_SIZE:
-            code_block_service.load_code_blocks(code_blocks)
-            print(f'====PROCESSED BATCH OF {len(code_blocks)} BLOCKS====')
-            code_blocks = []  # Clear the batch
+            # For first batch, create new index registry and FAISS index
+            if index_registry_id is None:
+                index_registry_id, faiss_file = await ingest_index(code_directory)
+                index_path = os.path.join(INDEX_DIR, faiss_file)
+                embedding_index = EmbeddingIndex(index_path)
+            
+            # Generate embeddings for current batch
+            batch_embeddings = model.generate_embeddings(code_blocks)
+            
+            # Store embeddings in FAISS index
+            embedding_index.add_embeddings(batch_embeddings)
+            
+            # Update database with batch information
+            await finalize_index_build(code_blocks, code_directory, index_registry_id)
+            
+            print(f'====PROCESSED AND INDEXED BATCH OF {len(code_blocks)} BLOCKS====')
+            code_blocks = []  # Clear the batch for next iteration
 
     # Process any remaining blocks
     if code_blocks:
-        code_block_service.load_code_blocks(code_blocks)
-        print(f'====PROCESSED FINAL BATCH OF {len(code_blocks)} BLOCKS====')
+        # Handle first batch case if total blocks were less than batch size
+        if index_registry_id is None:
+            index_registry_id, faiss_file = await ingest_index(code_directory)
+            index_path = os.path.join(INDEX_DIR, faiss_file)
+            embedding_index = EmbeddingIndex(index_path)
+        
+        batch_embeddings = model.generate_embeddings(code_blocks)
+        embedding_index.add_embeddings(batch_embeddings)
+        await finalize_index_build(code_blocks, code_directory, index_registry_id)
+        print(f'====PROCESSED AND INDEXED FINAL BATCH OF {len(code_blocks)} BLOCKS====')
 
     print(f'====TOTAL CODE BLOCKS PROCESSED: {total_blocks}====')
-
-    code_blocks = code_block_service.get_code_blocks()
-
-    # raw_code_blocks = code_block_service.extract_raw_code(code_directory)
-    # code_block_service.load_code_blocks(raw_code_blocks)
-    # code_blocks = code_block_service.get_code_blocks()
-    # print('====CODEBLOCKS RETRIEVED====')
-    # print(len(code_blocks))
-
-    return code_blocks
+    return index_registry_id, index_path
 
 def generate_embeddings(code_blocks):
     model = Model()
@@ -525,14 +547,10 @@ def get_vector_test(index):
     print(fv)
 
 async def build_code_index(code_blocks, code_directory):
-   
-    
     index_registry_id, faiss_file = await ingest_index(code_directory)
     await finalize_index_build(code_blocks, code_directory, index_registry_id)
     index_path = os.path.join(INDEX_DIR, faiss_file)
-
     return index_registry_id, index_path
-    # await semantic_search(index_path, index_registry_id, verbose, export)
 
 async def get_shard_active_index(code_directory):
     index_registry = await get_index(code_directory)
