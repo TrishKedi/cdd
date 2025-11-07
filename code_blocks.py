@@ -1,561 +1,818 @@
-import utils
-from settings import *
-import json
-import os
-import typer
 from pathlib import Path
-from typing import Iterable, List
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-from rich.syntax import Syntax
-from rich.text import Text
-from services import SimilarityLookup, CodeBlock, EmbeddingIndex, Model
-from database.ingest import finalize_index_build, get_embeddings, ingest_index, get_index, delete_single_repo
-import asyncio
-from utils import sha256_hex, path_prefix_of, shard_key_for
-from functools import reduce
-from concurrent.futures import ThreadPoolExecutor
+import json, subprocess, tempfile
+import typer
+import numpy as np
+from tree_sitter import Language, Parser,  Query, Tree, Node
+import tree_sitter_javascript   as tsjs
+import hashlib, uuid
+import os
+import re
+import time
+from multiprocessing import Pool, cpu_count
+from functools import partial
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, Any, Tuple, List, Optional, Set, Iterator
 
-app = typer.Typer()
+@dataclass
+class FileCache:
+    """Cache entry for a processed file."""
+    mtime: float           # File's modification time
+    size: int             # File size
+    fragments: List[Dict]  # Extracted code fragments
+    hash: str             # Content hash
 
-INDEX_PATH = utils.get_index_path()
-similarity_lookup = SimilarityLookup(SIMILARITY_THRESHOLD)
-
-console = Console()
-
-def _short(code: str, max_lines: int = 8) -> str:
-    lines = code.splitlines()
-    return "\n".join(lines[:max_lines] + (["…"] if len(lines) > max_lines else []))
-
-def _score_style(score: float) -> str:
-    if score >= 0.90: return "bold green"
-    if score >= 0.80: return "yellow"
-    return "red"
-
-def _link_text(path: Path, label: str, line: int = None) -> Text:
-    # Makes the label clickable in modern terminals (VS Code, iTerm2, Windows Terminal)
-    t = Text(label)
-    uri = f"vscode://file/{path.resolve().as_posix()}"
-    if line is not None:
-        uri += f":{line}"
-    t.stylize(f"link {uri}")
-    return t
-
-def print_matches(matches, project_root, verbose=False):
-
-    """
-    matches: iterable of objects like:
-      {
-        "path": "<source file>",
-        "code": "<source snippet>",
-        "matches": [ {"score": float, "path": "<target file>", "code": "<target snippet>", "start": int} ... ]
-      }
-    """
-    root = (project_root or Path(".")).resolve()
-
-    # --- Statistics calculation ---
-    files_with_matches = 0
-    total_matches = 0
-    all_scores = []
-    for entry in matches:
-        rows = entry.get("matches") or []
-        print(f"rows:{rows}")
-        if rows:
-            files_with_matches += 1
-            total_matches += len(rows)
-            all_scores.extend([float(m.get("score", 0)) for m in rows if "score" in m])
-
-    avg_score = sum(all_scores) / len(all_scores) if all_scores else 0
-
-    # --- Statistics Table ---
-    stats_table = Table(show_header=False, box=None)
-    stats_table.add_row("Files with matches:", str(files_with_matches))
-    stats_table.add_row("Total semantic clones:", str(total_matches))
-    stats_table.add_row("Average match score:", f"{avg_score:.2f}" if all_scores else "N/A")
-
-    console.print(Panel(stats_table, title="Summary", border_style="green"))
-
-    # --- Existing match display ---
-    for entry in matches:
-        src_path = Path(entry.get("path", "")).resolve()
-        src_label = src_path.relative_to(root) if src_path.is_absolute() else entry.get("path", "<?>")
-
-        rows = entry.get("matches") or []
-
-        if rows:
-            start = entry.get('start', 1)
-            console.rule(Text(f"File: {src_label}:{start}", style="bold cyan"))
-
-            if verbose:
-                src_code = entry.get("code") or ""
-                if src_code:
-                    syn = Syntax(_short(src_code), "javascript", theme="monokai", word_wrap=True)
-                    console.print(Panel(syn, title="Code", border_style="cyan"))
-
-            table = Table(show_header=True, header_style="bold magenta", expand=True)
-            table.add_column("Score", justify="right", width=6)
-            table.add_column("File", overflow="fold")
-            if verbose:
-                table.add_column("Snippet", overflow="fold")
-
-            for m in sorted(rows, key=lambda x: x.get("score", 0), reverse=True):
-                score = float(m.get("score", 0))
-                score_text = Text(f"{score:.2f}", style=_score_style(score))
-
-                tgt_path = Path(m.get("path", "")).resolve()
-                tgt_label = tgt_path.relative_to(root) if tgt_path.is_absolute() else m.get("path", "<?>")
-                start_line = m.get("start")
-                label_with_line = f"{tgt_label}:{start_line}" if start_line is not None else str(tgt_label)
-                clickable = _link_text(tgt_path, label_with_line, start_line)
-
-                if verbose:
-                    tgt_code = m.get("code") or ""
-                    syn = Syntax(_short(tgt_code), "javascript", theme="monokai", word_wrap=True)
-                    table.add_row(score_text, clickable, syn)
-                else:
-                    table.add_row(score_text, clickable)
-
-            console.print(Panel(table, title="Matches", border_style="magenta"))
-
-@app.command()
-def run_pipeline(
-    code_locations: List[str] = typer.Argument(..., help="Path to the code directory"),
-    verbose: bool = typer.Option(False, help="Show code snippets in output"),
-    rebuild: bool = typer.Option(False, help="Build index for given repo(s)"),
-    export: bool = typer.Option(False, help="Export matches to json file"),
-
-):
-    async def run_all():
-
-        index_path_id_map = {}
-        faiss_indexes = []
-
-        if rebuild:
-            print("rebuild index")
-            faiss_files = await delete_single_repo(code_locations)
-            for faiss_file in faiss_files:
-                file_path = os.path.join(INDEX_DIR,faiss_file)
-                if os.path.exists(file_path):
-                    os.remove(file_path)  # deletes the file
-                    print(f"Repo Faiss index deleted: {file_path}")
-            # return
-                    
-        for code_directory in code_locations:            
-            index_registry = await get_shard_active_index(code_directory)
-            print(f"index_registry: {index_registry}")
-            if index_registry:
-                faiss_file = index_registry.get('file_name')
-                index_registry_id = index_registry.get('index_id')
-                index_path_id_map[index_registry_id] = os.path.join(INDEX_DIR, faiss_file)
-                faiss_indexes.append(os.path.join(INDEX_DIR, faiss_file))
-                continue
-
-            code_blocks = retrieve_code_blocks(code_directory)
-            index_registry_id, index_path = await build_code_index(code_blocks, code_directory)
-            embeddings = generate_embeddings(code_blocks)
-            store_embeddings(embeddings, index_path)
-            index_path_id_map[index_registry_id] = index_path
-
+class FileProcessingCache:
+    """Manages caching of processed files to avoid reprocessing unchanged files."""
     
-        # matches = await run_exhaustive_similarity_lookup(index_path_id_map)
-        # print(f"MATCHES: \n\n\n{matches[0]}\n\n\n")
+    def __init__(self, cache_file: str = ".code_block_cache.json"):
+        self.cache_file = cache_file
+        self.cache: Dict[str, FileCache] = {}
+        self.load_cache()
 
-
-        # display_matches(matches[0], verbose, export)
-
-    asyncio.run(run_all())
-
-def retrieve_code_blocks(code_directory):
-    BATCH_SIZE = 50  # Adjust based on your memory constraints
-    total_blocks = 0
-    code_blocks = []
-    code_block_service = CodeBlock()
-
-    for block in code_block_service.extract_raw_code(code_directory, batch_size=BATCH_SIZE):
-        code_blocks.append(block)
-        total_blocks += 1
-        
-        # Process in batches to manage memory
-        if len(code_blocks) >= BATCH_SIZE:
-            code_block_service.load_code_blocks(code_blocks)
-            print(f'====PROCESSED BATCH OF {len(code_blocks)} BLOCKS====')
-            code_blocks = []  # Clear the batch
-
-    # Process any remaining blocks
-    if code_blocks:
-        code_block_service.load_code_blocks(code_blocks)
-        print(f'====PROCESSED FINAL BATCH OF {len(code_blocks)} BLOCKS====')
-
-    print(f'====TOTAL CODE BLOCKS PROCESSED: {total_blocks}====')
-
-    code_blocks = code_block_service.get_code_blocks()
-
-    # raw_code_blocks = code_block_service.extract_raw_code(code_directory)
-    # code_block_service.load_code_blocks(raw_code_blocks)
-    # code_blocks = code_block_service.get_code_blocks()
-    # print('====CODEBLOCKS RETRIEVED====')
-    # print(len(code_blocks))
-
-    return code_blocks
-
-def generate_embeddings(code_blocks):
-    model = Model()
-    embeddings = model.generate_embeddings(code_blocks)
-    print('====EMBEDDIGS GENERATED====')
-
-    return embeddings
-
-def store_embeddings(embeddings, index_path):
-    embedding_index = EmbeddingIndex(index_path)
-    embedding_index.add_embeddings(embeddings)
-    print('====EMBEDDIGS ADDED TO FAISS INDEX====')
-
-async def semantic_search(index_path, index_registry_id, index_path_id_map, visited, combined_matches, candidate_embeddings):
-    query_embeddings = candidate_embeddings[index_registry_id]
-    
-    # print(query_embeddings)
-    similarity_lookup = SimilarityLookup(index_path, SIMILARITY_THRESHOLD)
-    matches = similarity_lookup.run_exhaustive_similarity_lookup(query_embeddings, index_path_id_map, visited, combined_matches, candidate_embeddings)
-
-    return matches
-
-# async def get_index_embeddings(index_path_id_map):
-#     index_embeddings = {}
-#     for index_id in index_path_id_map:
-#         index_embeddings[index_id] = await get_embeddings(index_id)
-#     return index_embeddings
-
-
-
-async def exhaustive_search(index_path_id_map):
-    combined_matches = []
-    visited = set()
-    candidate_embeddings = await get_index_embeddings(index_path_id_map)
-    for index_registry_id, index_path in index_path_id_map.items():
-        matches = await semantic_search(index_path, index_registry_id, index_path_id_map, visited, combined_matches, candidate_embeddings)
-        combined_matches += matches
-        visited.add(index_registry_id)
-    
-    return combined_matches
-
-# async def run_exhaustive_similarity_lookup(index_path_id_map):
-#     similarity_lookup = SimilarityLookup(SIMILARITY_THRESHOLD)
-#     embeddings = await get_index_embeddings(index_path_id_map)
-#     matches = []
-#     query_index_stack = list(index_path_id_map.keys())
-#     print(f"======Initial query_index_stack====:\n{query_index_stack}\n")
-
-#     while len(query_index_stack):
-#         candidate_index_stack = query_index_stack.copy()
-#         query_index = query_index_stack.pop()
-#         query_embeddings = embeddings[query_index]
-#         query_index_path = index_path_id_map[query_index]
-            
-#         def reduce_candidates(matches, candidate_index):
-#             print(f"query_index: {query_index} , candidate_index: {candidate_index}")
-#             # print(f"======candidate_index====:\n\n{candidate_index}\n\n")
-#             candidate_embeddings = embeddings[candidate_index]
-#             candidate_index_path = index_path_id_map[candidate_index]
-
-#             new_matches = similarity_lookup.run_similarity_lookup(
-#                 query_embeddings, 
-#                 candidate_embeddings, 
-#                 query_index_path, 
-#                 candidate_index_path
-#             )
-
-#             matches+=new_matches
-#             # print(f"======MATCHES====:\n\n\n{matches}\n\n\n")
-            
-#             return matches
-
-#         # print(f"======MATCHES====:\n\n\n{matches}\n\n\n")
-#         matches += reduce(reduce_candidates, candidate_index_stack, matches)
-
-#     return matches
-
-
-async def yield_index_blocks(index_path_id_map):
-
-    for index_id, index_path in index_path_id_map.items():
-        blocks = await get_embeddings(index_id)
-
-        yield index_path, blocks
-
-
-async def get_index_blocks(index_path_id_map):
-    index_blocks = {}
-    for index_id, index_path in index_path_id_map.items():
-        index_blocks[index_path] = await get_embeddings(index_id)
-
-    return index_blocks
-
-# async def search_all_shards(faiss_indexes, query_index_path):
-#     loop = asyncio.get_running_loop()
-#     max_workers = min(len(faiss_indexes), os.cpu_count() or 4)
-#     print(f"number of workers:{max_workers}")
-#     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-#         tasks = [
-#             loop.run_in_executor(ex, similarity_lookup.search_shard, cand_index_path, query_index_path)
-#             for cand_index_path in faiss_indexes
-#         ]
-#         results = await asyncio.gather(*tasks)
-
-async def search_all_shards(faiss_indexes, query_index_path, query_blocks, blocks):
-  
-    loop = asyncio.get_running_loop()
-    max_workers = min(len(faiss_indexes), os.cpu_count() or 4)
-    print(f"number of workers:{max_workers}")
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        tasks = [
-            loop.run_in_executor(
-                ex, 
-                similarity_lookup.search_shard,
-                cand_index_path, 
-                query_index_path
-            )
-            for cand_index_path in faiss_indexes
-        ]
-        results = await asyncio.gather(*tasks)
-
-    def sim_matches(block_tup, result):
-        print(query_blocks)
-        
-        block_vector_id = block_tup[0]
-        m = block_tup[1]
-        neighbours = result[0]
-        scores = result[1]
-        neighbour_similarity_map = list(zip(neighbours, scores))
-
-        print(f"VECTOR_ID: \n\n\n{block_vector_id}\n\n\n")
-        
-
-        block = filter_blocks(query_blocks, block_vector_id)
-        block_id = block[0]
-        vector_id = block[1]
-        path = block[2]
-        code = block[3]
-        start = block[4]
-
-        matches = {
-            'code': code,
-            'path': path,
-            'start': start,
-            'matches':[ 
-                {
-                    # "id": code_blocks[ns_map[0]].get('id'),
-                    "path": filter_blocks(cand_blocks, ns_map[0])[2],
-                    # query_blocks[ns_map[0]][2], #To do ----extract this from DB via queries
-                    "score": ns_map[1],
-                    "code": filter_blocks(cand_blocks, ns_map[0])[3], #To do ----extract this from DB via queries
-                    "start": filter_blocks(cand_blocks, ns_map[0])[4],
-
+    def save_cache(self) -> None:
+        """Save cache to disk."""
+        try:
+            with open(self.cache_file, 'w') as f:
+                cache_dict = {
+                    path: {
+                        'mtime': entry.mtime,
+                        'size': entry.size,
+                        'fragments': entry.fragments,
+                        'hash': entry.hash
+                    }
+                    for path, entry in self.cache.items()
                 }
-                for ns_map in neighbour_similarity_map 
-                if ns_map[1] >= similarity_threshold
-                # and self.is_unique_match(unique_matches, [vector_id, ns_map[0]])
-                ] 
-        }
-        block_vector_id+=1
-        m.append(matches)
+                json.dump(cache_dict, f)
 
-        return block_vector_id, matches
-        
+        except Exception as e:
+            typer.echo(f"⚠️ Cache saving failed: {e}")
+    
+    def load_cache(self) -> None:
+        """Load cache from disk if it exists."""
+        try:
+            if os.path.exists(self.cache_file):
+                with open(self.cache_file, 'r') as f:
+                    data = json.load(f)
+                    self.cache = {
+                        path: FileCache(**entry)
+                        for path, entry in data.items()
+                    }
+        except Exception as e:
+            typer.echo(f"⚠️ Cache loading failed: {e}")
+            self.cache = {}
     
 
-    def reduce_matches(cand_tup, cand_result):
-        all_matches = []
-        matches = cand_tup[1]
-        cand_pstn = cand_tup[0]
-        cand_blocks = blocks[faiss_indexes[cand_pstn]]
-        
-        all_matches+=matches
-        cand_pstn+=1
-        all_matches+=matches
-        return cand_pstn, all_matches
+# Default patterns for files to exclude
+DEFAULT_EXCLUDE_PATTERNS = {
+    # Build and output directories
+    '**/dist/**',
+    '**/build/**',
+    '**/out/**',
+    
+    # Dependencies
+    '**/node_modules/**',
+    '**/bower_components/**',
+    '**/vendor/**',
+    
+    # Test files
+    '**/test/**',
+    '**/tests/**',
+    '**/*.test.js',
+    '**/*.spec.js',
+    
+    # Minified files
+    '**/*.min.js',
+    '**/*-min.js',
+    '**/*bundle*.js',
+    
+    # Generated files
+    '**/*.generated.js',
+    '**/*.g.js',
+    
+    # Configuration files
+    '**/webpack.config.js',
+    '**/rollup.config.js',
+    '**/jest.config.js',
+    '**/babel.config.js',
+    
+    # Source maps
+    '**/*.js.map'
+}
 
-    # matches = reduce(reduce_matches, results, (0, []))
-    # matches = reduce(sim_matches, cand_result, (0, matches))
+# Patterns for detecting minified JavaScript
+MINIFIED_JS_INDICATORS = [
+    r'sourceMappingURL',      # Source map reference
+    r'\.min\.js$',           # .min.js extension
+    r'^[^\\n]{500,}$',       # Long lines (typical in minified code)
+    r'\]{3,}',              # Multiple closing brackets in sequence
+    r'\}{3,}'               # Multiple closing braces in sequence
+]
+class CodeBlock:
+
+    def __init__(self):
+
+        # self.JAVASCRIPT = Language(tsjs.language())
+        self.code_blocks = []
+        # self.parser = Parser(self.JAVASCRIPT)
+        self.exclude_patterns = DEFAULT_EXCLUDE_PATTERNS
+        self.minified_patterns = [re.compile(pattern) for pattern in MINIFIED_JS_INDICATORS]
+        self.cache = FileProcessingCache()  # Initialize the cache handler
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.CONTROLLER_QUERY = r"""
+        (call_expression
+        function: (member_expression
+            property: (property_identifier) @callee_name
+        )
+        arguments: (arguments
+            (_)
+            (object) @controller_obj
+            .
+        )
+        (#eq? @callee_name "extend")
+        )"""
         
+        METHODS_QUERY = r"""
+        ; 1) Method shorthand: onInit() { ... }
+        (object
+        (method_definition
+            name: (property_identifier) @method_name
+        )
+        ) @m1
+
+        ; 2) Pair with function value: onInit: function (...) { ... }
+        (object
+        (pair
+            key: (property_identifier) @method_name
+            value: (function) @fn
+        )
+        ) @m2
+
+        ; 3) Pair with arrow function value: onSomething: (...) => { ... }
+        (object
+        (pair
+            key: (property_identifier) @method_name
+            value: (arrow_function) @afn
+        )
+        ) @m3
+
+        ; (optional) quoted keys: "onInit": function () {}
+        (object
+        (pair
+            key: (string) @method_name_str
+            value: (function) @fn2
+        )
+        ) @m4
+
+        (object
+        (pair
+            key: (string) @method_name_str
+            value: (arrow_function) @afn2
+        )
+        ) @m5
+        """
+        
+
+        # self.ARROW_FUNCS = r"""
+        # (object 
+        # (pair 
+        #     key: (property_identifier) @method_name
+        #     value: (arrow_function parameters: @afn
+        #     (formal_parameters (identifier)) @m3
+        # """
+
+        self.ARROW_FUNCS = r"""
+        (object 
+        (pair 
+            key: (property_identifier) @method_name
+            value: (arrow_function) @afn
+        )
+        )
+      
+        (object
+        (method_definition
+            name: (property_identifier) @method_name
+        )
+        ) @afn
+
+        (pair
+            key: (property_identifier) @method_name
+            value: (function_expression) @afn
+        )
+
+        (method_definition
+            name: (property_identifier) @method_name
+        ) @afn
+        """
+
+        # self.ARROW_FUNCS = r"""
+        # (object
+        # (pair
+        #     key: (property_identifier) @method_name
+        #     value: (arrow_function) @afn
+        # )
+        # ) @m3
+        # """
+
+        self.FUNCTION_QUERY = r"""
+        (function_declaration) @func
+        (lexical_declaration
+        (variable_declarator
+            name: (identifier) @var_name
+            value: [(arrow_function) (function)] @func
+        )
+        )
+        (expression_statement
+        (assignment_expression
+            left: (member_expression) @member
+            right: [(arrow_function) (function)] @func
+        )
+        )
+        (method_definition) @func
+        (pair
+        key: (property_identifier) @prop
+        value: [(arrow_function) (function)] @func
+        )
+        """
+
+        
+
+        self.OBJECT_METHODS_AND_PAIRS = r"""
+        ; method shorthand: onInit() { ... } / render() { ... }
+        (method_definition
+        name: (property_identifier) @prop_name
+        ) @mdef
+
+        ; key: function(...) { ... }  or  key: (...) => { ... }
+        (pair
+        key: (property_identifier) @prop_name
+        value: (choice (function) (function_expression) (arrow_function))
+        ) @mpair
+
+        ; allow quoted keys: "onInit": function(){}, "render": ()=>{}
+        (pair
+        key: (string) @prop_name_str
+        value: (choice (function) (function_expression) (arrow_function))
+        ) @mpair_str
+        """
+
+    def load_code_blocks(self, code_blocks_list):
+        self.code_blocks = code_blocks_list
+
+         
+    def set_all_embeddings(self, embeddings):
+        for index, cb in enumerate(self.code_blocks):
+            # print(f'=====SIMILARITY FOR CODE BLOCK #{index}====')
+            # print(cb.processedCode)
+            cb['embeddings'] = embeddings[index].tolist()
             
+    def set_matches(self, blockId, matches):
+        
+        def filter_block(block):
+            return block.id == blockId
             
+        current_block = filter(filter_block, self.code_blocks)[0]
+        current_block['matches'] = matches
 
+    def get_code_blocks(self):
+        return self.code_blocks
 
-
+    def _process_single_file(self, file_path: Path) -> List[Dict[str, Any]]:
+        """Process a single JavaScript file to extract code blocks.
         
-    
-    # return {
-    #     index_file : results
+        This is a helper method designed to run in a separate process.
         
-    # }
-    # print(len(results))
-    # print(f"results: \n\n\n{matches}\n\n\n")
-    return results
+        Args:
+            file_path: Path to the JavaScript file to process
+            
+        Returns:
+            List of extracted code blocks with their metadata
+        """
+        try:
+            fragments = self.fragments_from_file(file_path)
+            typer.echo(f"📄 Loaded {file_path} ({len(fragments)} fragments)")
+            return fragments
+        except Exception as e:
+            typer.echo(f"⚠️ Skipping {file_path}: {e}")
+            return []
 
-# async def generate_lookup_results(index_path_id_map):
-#     faiss_indexes = list(index_path_id_map.values())
-#     results = {}
-
-#     # blocks, index_path = await get_index_blocks(index_path_id_map)
-#     for index_path in faiss_indexes:
-#         index_file = os.path.basename(index_path)
-#         shard_results = await search_all_shards(faiss_indexes, index_path)
-#         faiss_indexes.remove(index_path)
-#         # shard_results['query_index_path'] = index_path
-#         # results[index_file] = shard_results
-
-#         yield shard_results
+    def extract_raw_code(self, code_dir: str, batch_size: int = 50) -> Any:
+        """Extract code blocks from JavaScript files in a directory using parallel processing,
+        lazy loading, and caching.
         
-#     # return results
-
-async def generate_lookup_results(index_path_id_map):
-    faiss_indexes = list(index_path_id_map.values())
-    blocks = await get_index_blocks(index_path_id_map)
-    results = []
-    async for index_path, q_blocks in yield_index_blocks(index_path_id_map):
-        # print(f"index_path: \n\n\n {index_path} \n\n\n")
-        shard_results = await search_all_shards(faiss_indexes, index_path, q_blocks, blocks)
-        faiss_indexes.remove(index_path)
-        results+=shard_results
-    
-    # print(results)
-    return results
-
-async def generate_query_results(results):
-    for index_path, query_results in results.items():
-        for result in query_results:
-            yield result
-
-def filter_blocks(blocks, faiss_vector_id):
-    def filter_by_fvid(query_blocks):
-        return query_blocks[1] == faiss_vector_id
-    
-    return list(filter(filter_by_fvid, query_blocks))[0]
-
-async def process_results(index_path_id_map):
-    all_matches = {}
-    all_blocks = await get_index_blocks(index_path_id_map)
-    
-
-
-    async for query, result in generate_lookup_results(index_path_id_map):
-        search_results = []
+        This method combines parallel processing, lazy loading, and file caching to optimize
+        both CPU and memory usage while avoiding reprocessing unchanged files. Instead of
+        loading all files at once, it processes them in batches while yielding results
+        incrementally.
         
-        search_results = result.get('search_results')
+        Args:
+            code_dir: Path to the directory containing JavaScript files
+            batch_size: Number of files to process in each batch
+            
+        Yields:
+            Dict[str, Any]: Code blocks with their metadata, yielded as they're processed
+            
+        Raises:
+            typer.Exit: If the directory does not exist or is not valid
+        """
+        self._id_counter = 0
+        directory = Path(code_dir)
         
+        if not directory.exists() or not directory.is_dir():
+            typer.echo(f"❌ {directory} is not a valid directory.")
+            raise typer.Exit(code=1)
 
-
-        print(f"search_results:\n\n\n{result}\n\n\n")
-
-       
+        # Get list of all JS files and filter them
+        all_js_files = list(directory.rglob("*.js"))
+        js_files = [f for f in all_js_files if self.should_process_file(f)]
         
+        skipped = len(all_js_files) - len(js_files)
+        if skipped > 0:
+            typer.echo(f"🔍 Filtered out {skipped} files based on exclusion rules")
         
-        if search_results:
-            query_index_path = result.get('query_index_path')
-            query_blocks = all_blocks[query_index_path]
+        if not js_files:
+            typer.echo("No suitable JavaScript files found to process.")
+            return
 
-            print(f"QUERY BLOCKS: \n\n\n{query_blocks}\n\n\n")
+        # First pass: check cache and collect files needing processing
+        files_to_process = []
+        for file_path in js_files:
+            cached_fragments = self.check_cache(file_path)
+            if cached_fragments is not None:
+                # Yield cached fragments immediately
+                for fragment in cached_fragments:
+                    fragment['id'] = self._id_counter
+                    self._id_counter += 1
+                    yield fragment
+            else:
+                files_to_process.append(file_path)
 
-            cand_index_path = os.path.join(INDEX_DIR, result.get('candidate_index_path'))
-            cand_blocks = all_blocks[cand_index_path]
+        if not files_to_process:
+            typer.echo("✨ All files loaded from cache!")
+            return
 
-            for block_vector_id, score_nb in enumerate(search_results):
-                neighbours = score_nb[0]
-                scores = score_nb[1]
-                neighbour_similarity_map = list(zip(neighbours, scores))
+        # Calculate optimal number of processes for remaining files
+        num_processes = min(cpu_count(), batch_size, len(files_to_process))
+        total_files = len(files_to_process)
+        processed_files = 0
+        
+        typer.echo(f"Processing {total_files} uncached files using {num_processes} CPU cores")
 
-                print(f"VECTOR_ID: \n\n\n{block_vector_id}\n\n\n")
+        # Process remaining files in batches
+        for i in range(0, len(files_to_process), batch_size):
+            batch = files_to_process[i:i + batch_size]
+            typer.echo(f"\nProcessing batch {(i//batch_size) + 1} ({len(batch)} files)")
+            
+            # Process batch in parallel
+            with Pool(processes=num_processes) as pool:
+                fragment_lists = pool.map(self._process_single_file, batch)
                 
+            # Update cache and yield fragments as they're processed
+            for file_path, fragments in zip(batch, fragment_lists):
+                if fragments:  # Only cache successful processing
+                    self.update_cache(file_path, fragments)
+                    for fragment in fragments:
+                        fragment['id'] = self._id_counter
+                        self._id_counter += 1
+                        yield fragment
+                    
+            processed_files += len(batch)
+            typer.echo(f"Progress: {processed_files}/{total_files} files processed")
+        
+        # Print cache statistics
+        total_files = self.cache_hits + self.cache_misses
+        if total_files > 0:
+            hit_rate = (self.cache_hits / total_files) * 100
+            typer.echo(f"\n📊 Cache Statistics:")
+            typer.echo(f"   Hits: {self.cache_hits}")
+            typer.echo(f"   Misses: {self.cache_misses}")
+            typer.echo(f"   Hit Rate: {hit_rate:.1f}%")
 
-                # block = filter_blocks(query_blocks, block_vector_id)
-                # block_id = block[0]
-                # vector_id = block[1]
-                # path = block[2]
-                # code = block[3]
-                # start = block[4]
+    def assign_ids(self, all_fragments):
+    
+        for frag_key, frag in enumerate(all_fragments):
+            frag['id'] = frag_key
 
+    def update_cache(self, file_path: Path, fragments: List[Dict[str, Any]]) -> None:
+        """Update the cache with new file fragments.
+        
+        Args:
+            file_path: Path to the processed file
+            fragments: List of extracted code fragments
+        """
+        try:
+            stat = file_path.stat()
+            self.cache.cache[str(file_path)] = FileCache(
+                mtime=stat.st_mtime,
+                size=stat.st_size,
+                fragments=fragments,
+                hash=hashlib.sha256(file_path.read_bytes()).hexdigest()
+            )
+            self.cache.save_cache()  # Persist cache to disk
+        except Exception as e:
+            typer.echo(f"⚠️ Cache update failed for {file_path}: {e}")
             
-                # matches = {
-                # 'code': code,
-                # 'path': path,
-                # 'start': start,
-                # 'matches':[ 
-                #     {
-                #         # "id": code_blocks[ns_map[0]].get('id'),
-                #         "path": filter_blocks(cand_blocks, ns_map[0])[2],
-                #         # query_blocks[ns_map[0]][2], #To do ----extract this from DB via queries
-                #         "score": ns_map[1],
-                #         "code": filter_blocks(cand_blocks, ns_map[0])[3], #To do ----extract this from DB via queries
-                #         "start": filter_blocks(cand_blocks, ns_map[0])[4],
+    def check_cache(self, file_path: Path) -> Optional[List[Dict[str, Any]]]:
+        """Check if a file is in the cache and return its fragments if valid.
+        
+        This method:
+        1. Checks if the file exists in the cache
+        2. Validates file metadata (size and mtime) hasn't changed
+        3. Returns cached fragments if valid, None otherwise
+        
+        Args:
+            file_path: Path to the file to check in cache
+            
+        Returns:
+            List of cached fragments if valid cache exists, None otherwise
+        """
+        try:
+            stat = file_path.stat()
+            path_str = str(file_path)
+            
+            # Check if file is in cache and metadata matches
+            if path_str in self.cache.cache:  # Use FileProcessingCache's cache dict
+                cached = self.cache.cache[path_str]
+                if (cached.mtime == stat.st_mtime and 
+                    cached.size == stat.st_size):
+                    self.cache_hits += 1
+                    return cached.fragments
+            
+            self.cache_misses += 1
+            return None
+            
+        except Exception as e:
+            typer.echo(f"⚠️ Cache check failed for {file_path}: {e}")
+            return None
+        
+    def babel_ast_from_code(code: str):
+        with tempfile.NamedTemporaryFile("w+", suffix=".js", delete=False) as f:
+            f.write(code); f.flush()
+            out = subprocess.check_output(["node", "/Users/patriciaatim/Documents/personal-projects/code-duplication-detector/examples/jcdd-parser.js", f.name])
+        return json.loads(out)
 
-                #     }
-                #     for ns_map in neighbour_similarity_map 
-                #     if ns_map[1] >= similarity_lookup.similarity_threshold
-                #     # and self.is_unique_match(unique_matches, [vector_id, ns_map[0]])
-                #     ] 
-                # }
+    def parse_js(self, code: str):
+        return self.parser.parse(bytes(code, "utf-8"))
 
-                # print(f"MATCHES:\n\n\n{matches}\n\n\n")
+    def should_process_file(self, file_path: Path) -> bool:
+        """Determine if a file should be processed based on filtering rules.
+        
+        This method applies several filters to determine if a file should be processed:
+        1. Checks against exclude patterns (test files, minified files, etc.)
+        2. Analyzes file content for minification
+        3. Validates file size
+        
+        Args:
+            file_path: Path to the JavaScript file
+            
+        Returns:
+            bool: True if the file should be processed, False if it should be skipped
+        """
+        try:
+            # Check against exclude patterns
+            for pattern in self.exclude_patterns:
+                if file_path.match(pattern):
+                    typer.echo(f"📝 Skipping excluded file: {file_path}")
+                    return False
+            
+            # Check file size (skip if too large)
+            if file_path.stat().st_size > 1_000_000:  # Skip files larger than 1MB
+                typer.echo(f"📝 Skipping large file: {file_path}")
+                return False
+            
+            # Read first few KB to check for minification
+            sample = file_path.read_text(encoding='utf-8', errors='ignore')[:5000]
+            
+            # Check for minification indicators
+            for pattern in self.minified_patterns:
+                if pattern.search(sample):
+                    typer.echo(f"📝 Skipping minified file: {file_path}")
+                    return False
+            
+            # Check for suspiciously long lines (typical in minified code)
+            max_line_length = max((len(line) for line in sample.splitlines()[:10]), default=0)
+            if max_line_length > 500:
+                typer.echo(f"📝 Skipping likely minified file (long lines): {file_path}")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            typer.echo(f"⚠️ Error checking file {file_path}: {e}")
+            return False
 
-async def run_exhaustive_similarity_lookup(index_path_id_map):
+    # 2) walk & extract function-like fragments
 
-    matches = await generate_lookup_results(index_path_id_map)
-    print(matches)
+    def iter_captures(self, query: Query, root):
+        """
+        Normalize Tree-sitter captures to (node, capture_name) across versions:
+        - Some return (node, name), others (node, index, pattern_index)
+        """
+        for cap in query.captures(root):
+            node = cap[0]
+            second = cap[1]
+            if isinstance(second, str):
+                name = second
+            else:
+                name = query.capture_names[second]
+            yield node, name
 
-    return matches
+    def get_controller_nodes(self, tree: Tree, language: Optional[Language] = None) -> List[Node]:
+        """Extract controller object nodes from a JavaScript AST.
+        
+        Looks for patterns matching controller objects in Angular-style code,
+        specifically objects passed to .extend() calls.
+        
+        Args:
+            tree: The parsed tree-sitter AST to search
+            language: Optional tree-sitter language instance. If not provided, uses self.JAVASCRIPT
+            
+        Returns:
+            List of tree-sitter nodes representing controller objects
+        """
+        controller_objs = []
+        # Use provided language or fall back to self.JAVASCRIPT
+        js_lang = language
+        controller_q = Query(js_lang, self.CONTROLLER_QUERY)
+        controller_q_result = controller_q.captures(tree.root_node)
+        
+        if controller_q_result.get('controller_obj'):
+            controller_objs = controller_q_result.get('controller_obj')
+
+        # print(f"========Controller Nodes=======: \n {controller_objs} \n")
+        return controller_objs
+
+    # def extract_function_nodes(self, tree, code_bytes: bytes):
+    #     # print(f'TREE:\n{tree}\n')
+    #     FUNCTION_TYPES = {
+    #         "function_declaration",
+    #         # "function",
+    #         "arrow_function",
+    #         "method_definition",
+    #     }
+    #     cursor = tree.walk()
+    #     # print(f'CURSOR:\n{cursor}\n')
+
+    #     test_node = cursor.node
+    #     # children_funcs = test_node.children_by_field_name('name')
+    #     # print(f'NODE:\n{test_node}\n')
+    #     # print(children_funcs)
+    #     walk_node = test_node.walk()
+    #     # print(walk_node)
+    #     # print(walk_node.goto_descendant(1))
+    #     # print(f'NEXT NODE:\n{walk_node.node}\n')
+    #     descendant_count = test_node.descendant_count
+    #     # descendant = cursor.goto_descendant(0)
+    #     # print(f"\n{descendant}\n")
+    #     frags = []
+    #     for i in range(1, descendant_count):
+            
+    #         descendant = walk_node.goto_descendant(i)
+    #         current_node = walk_node.node
+    #         # if current_node.type in FUNCTION_TYPES:
+
+    #         print(f"NODE TYPE:\n{current_node.type}\n")
+    #         print(f"CURRENT NODE:\n{current_node}\n")
+            
+    #         start, end = current_node.start_byte, current_node.end_byte
+    #         fragment_code = code_bytes[start:end].decode("utf-8", errors="ignore")
+    #         children_funcs = current_node.children_by_field_name('name')
+
+    #         code_up_to_fragment = code_bytes[:start].decode("utf-8", errors="ignore")
+    #         start_line = code_up_to_fragment.count('\n') + 1
+    #         code_up_to_end = code_bytes[:end].decode("utf-8", errors="ignore")
+    #         end_line = code_up_to_end.count('\n') + 1
+
+    #         print(f"=====fragment_codee===:{fragment_code}")
+    #         # print(f"=====end_line===:{end_line}")
+
+
+    #         # frags.append(fragment)
+    #         frags.append({
+    #             "code": fragment_code,
+    #             "start": start_line,
+    #             "end": end_line
+    #         })
+
+    #             # print(f'====FRAGMENT:====\n{fragment}\n')
+    #         # frags.append(fragment)
+
+    #     # print(f'FRAGS:\n{frags}\n')
+    #     return frags
+
+    def extract_function_nodes(self, root_node: Node, code_bytes: bytes, language: Optional[Language] = None) -> List[Dict[str, Any]]:
+        """Extract function-like nodes from a JavaScript AST.
+        
+        This method identifies and extracts various types of function definitions
+        including function declarations, expressions, arrow functions, and
+        method definitions.
+        
+        Args:
+            root_node: The root node of the AST to search
+            code_bytes: The raw bytes of the source code
+            language: Optional tree-sitter language instance. If not provided, uses self.JAVASCRIPT
+            
+        Returns:
+            List of dictionaries containing extracted function information with
+            keys: 'code', 'start', 'end', and optional metadata
+        """
+        # Use provided language or fall back to self.JAVASCRIPT
+        js_lang = language
+        query = Query(js_lang, self.ARROW_FUNCS)
+        
+        # Valid function-like node types
+        FUNCTION_TYPES = {
+            "function_declaration",
+            "function_expression",
+            "arrow_function",
+            "method_definition",
+        }
+        
+        fragments = []
+        func_captures = query.captures(root_node)
+        if func_captures.get('afn'):
+            nodes = func_captures.get('afn')
+            # print(f"=====NODE COUNT====: {len(nodes)}")
+            for i, node in enumerate(nodes):
+
+                if node.type in FUNCTION_TYPES:
+                    # print(f"=====NODE====: {node} ({capture_name})")
+                    # print(f"=====NODE TYPE====: {node}")
+                    # print(f"=====NODE TYPE====: {node.type}")
+
+                    # children = node.children
+                    # for child in children:
+
+                    #     print(f"=====CHILD TYPE====: {child.type}")
+                    #     child_code = code_bytes[child.start_byte:child.end_byte].decode("utf-8", errors="ignore")
+
+                    #     print(f"=====CHILD CODE====: {child_code}")
+
+                    #     print(f"=====CHILD NODE====: {child}")
+            
+                    # if node.type in FUNCTION_TYPES:
+                    start, end = node.start_byte, node.end_byte
+                    fragment_code = code_bytes[start:end].decode("utf-8", errors="ignore")
+                    code_up_to_fragment = code_bytes[:start].decode("utf-8", errors="ignore")
+                    start_line = code_up_to_fragment.count('\n') + 1
+                    code_up_to_end = code_bytes[:end].decode("utf-8", errors="ignore")
+                    end_line = code_up_to_end.count('\n') + 1
+
+                    # print(f"=====CODE#{i}====: {fragment_code}")
+
+                    fragments.append({
+                        "code": fragment_code,
+                        "start": start_line,
+                        "end": end_line,
+                    })
+
+        # print(f'FRAGS:\n{frags}\n')
+        return fragments
+
+
+    def normalize_js(self, snippet: str):
+        # print('========ORIGINAL CODE======')
+        # print(f'\n{snippet}\n')
+        _ident = re.compile(r"\b[A-Za-z_]\w*\b")
+        _num   = re.compile(r"\b\d+(\.\d+)?\b")
+        _strq  = re.compile(r"(\".*?\"|'.*?'|`.*?`)", re.S)
+        _space = re.compile(r"\s+")
+        # strip line/block comments
+        snippet = re.sub(r"//.*?$", "", snippet, flags=re.M)
+        snippet = re.sub(r"/\*.*?\*/", "", snippet, flags=re.S)
+        # normalize strings and numbers
+        # snippet = _strq.sub("<STR>", snippet)
+        # snippet = _num.sub("<NUM>", snippet)
+        # normalize identifiers (simple pass; you can do a scoped map)
+        # avoid JS keywords
+        keywords = set("""
+        break case catch class const continue debugger default delete do else export extends
+        finally for function if import in instanceof let new return super switch this throw try
+        typeof var void while with yield await enum implements interface package private protected public
+        """.split())
+        next_id = 1
+        mapping = {}
+        def repl(m):
+            nonlocal next_id
+            name = m.group(0)
+            if name in keywords:
+                return name
+            if name not in mapping:
+                mapping[name] = f"id_{next_id}"
+                
+                next_id += 1
+            return mapping[name]
+        # snippet = _ident.sub(lambda m: repl(m), snippet)
+        # whitespace & semicolons
+        snippet = snippet.replace(";", "")
+        snippet = _space.sub(" ", snippet).strip()
+        # print('========NORMALIZED CODE======')
+        # print(f'\n{snippet}\n')
+
+        return snippet
+
+    def canonicalize_js(self, snippet: str):
+        # print('========ORIGINAL CODE======')
+        # print(f'\n{snippet}\n')
+        _ident = re.compile(r"\b[A-Za-z_]\w*\b")
+        _num   = re.compile(r"\b\d+(\.\d+)?\b")
+        _strq  = re.compile(r"(\".*?\"|'.*?'|`.*?`)", re.S)
+        _space = re.compile(r"\s+")
+        # strip line/block comments
+        snippet = re.sub(r"//.*?$", "", snippet, flags=re.M)
+        snippet = re.sub(r"/\*.*?\*/", "", snippet, flags=re.S)
+        # normalize strings and numbers
+        snippet = _strq.sub("<STR>", snippet)
+        snippet = _num.sub("<NUM>", snippet)
+        # normalize identifiers (simple pass; you can do a scoped map)
+        # avoid JS keywords
+        keywords = set("""
+        break case catch class const continue debugger default delete do else export extends
+        finally for function if import in instanceof let new return super switch this throw try
+        typeof var void while with yield await enum implements interface package private protected public
+        """.split())
+        next_id = 1
+        mapping = {}
+        def repl(m):
+            nonlocal next_id
+            name = m.group(0)
+            if name in keywords:
+                return name
+            if name not in mapping:
+                mapping[name] = f"id_{next_id}"
+                
+                next_id += 1
+            return mapping[name]
+        snippet = _ident.sub(lambda m: repl(m), snippet)
+        # whitespace & semicolons
+        snippet = snippet.replace(";", "")
+        snippet = _space.sub(" ", snippet).strip()
+        # print('========CANON CODE======')
+        # print(f'\n{snippet}\n')
+
+        return snippet
+
+
+    def fragments_from_file(self, file_path: Path, parser: Optional[Parser] = None, language: Optional[Language] = None) -> List[Dict[str, Any]]:
+        """Extract and process code fragments from a JavaScript file.
+        
+        This method:
+        1. Parses the JavaScript file
+        2. Detects if it contains an Angular-style controller
+        3. Extracts function-like nodes
+        4. Normalizes the extracted code
+        
+        Args:
+            file_path: Path to the JavaScript file to process
+            parser: Optional tree-sitter parser instance. If not provided, creates a new one
+            language: Optional tree-sitter language instance. If not provided, creates a new one
+            
+        Returns:
+            List of dictionaries containing code blocks with metadata:
+            - code: Original code fragment
+            - processedCode: Normalized version of the code
+            - path: Source file path
+            - start: Starting line number
+            - end: Ending line number
+            
+        Raises:
+            UnicodeDecodeError: If file cannot be read as UTF-8
+            tree_sitter.LanguageError: If parsing fails
+        """
+        # Initialize or use provided parser/language
+        if language is None:
+            language = Language(tsjs.language())
+        if parser is None:
+            parser = Parser(language)
+            
+        # Read and parse the file
+        code = file_path.read_text(encoding="utf-8")
+        tree = parser.parse(bytes(code, "utf-8"))
+        root_node = tree.root_node
+        
+        # Check for Angular controller pattern
+        ctr_node = self.get_controller_nodes(tree, language)
+        if ctr_node:
+            typer.echo("Controller Node Detected")
+            root_node = ctr_node[0]
+        
+        # Extract function nodes using existing method
+        code_bytes = code.encode("utf-8")
+        fragments = self.extract_function_nodes(root_node, code_bytes, language)
+        
+        # Process and normalize fragments
+        processed_fragments = [
+            {
+                **fragment,
+                "processedCode": self.normalize_js(fragment.get('code')),
+                'path': str(file_path)
+            }
+            for fragment in fragments
+        ]
+        
+        return processed_fragments
+
+        
     
-    # return matches
 
-def display_matches(matches, verbose, export):
-    print_matches(matches, project_root=Path("."), verbose=verbose)
-    if export:
-        with open("matches.json", "w") as f:
-            json.dump(matches, f, indent=2)
-        print("Matches exported to matches.json")
-
-def get_vector_test(index):
-    code_blocks = utils.get_code_blocks(with_embeddings=True)
-
-    # f_cb = code_blocks[0]
-    # f_cb_id = f_cb.get('id')
-    # print(f"=====First vector id: {f_cb_id}=====")
-    fv = index.reconstruct(1)
-    print("=====First vector=====")
-    print(fv)
-
-async def build_code_index(code_blocks, code_directory):
-   
-    
-    index_registry_id, faiss_file = await ingest_index(code_directory)
-    await finalize_index_build(code_blocks, code_directory, index_registry_id)
-    index_path = os.path.join(INDEX_DIR, faiss_file)
-
-    return index_registry_id, index_path
-    # await semantic_search(index_path, index_registry_id, verbose, export)
-
-async def get_shard_active_index(code_directory):
-    index_registry = await get_index(code_directory)
-
-    # path_uri = index_registry.get('path_uri')
-    # faiss_index_file = index_registry.get('file_name')
-
-    # full_path = os.path.join(path_uri, faiss_index)
-
-    # if os.path.exists(full_path):
-    #     return full_path 
-
-    return index_registry
-
-def create_index_path_from_registry(index_registry):
-    print(f"index_registry: {index_registry}")
-    path_uri = index_registry.get('path_uri')
-    faiss_index_file = index_registry.get('file_name')
-
-    return os.path.join(path_uri, faiss_index_file)
-
-
-    print(f"index_registry: {index_registry}")
-
-if __name__ == "__main__":
-    app(no_exception_traceback=True)
